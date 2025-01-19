@@ -3,3 +3,12 @@
 
 # Ignore CSV files
 *.csv
+
+# Ignore outputs directory in Titans_project
+Titans_project/outputs/
+
+# Ignore lightning logs in Titans_project
+Titans_project/lightning_logs/
+
+# Ignore checkpoint files
+*.ckpt

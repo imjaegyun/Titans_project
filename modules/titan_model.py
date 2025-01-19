@@ -3,12 +3,15 @@
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
+from torch import nn
 
 from .lightweight_llm import LightWeightLLM
 from .vit_eagle import PretrainedViTEagle
 from .trajectory_encoder import TrajectoryEncoder
 from .base_llm import BaseLLM
 from .titans_core import TitansDecoder
+
+import pandas as pd
 
 class TitanModel(pl.LightningModule):
     def __init__(
@@ -30,9 +33,9 @@ class TitanModel(pl.LightningModule):
             freeze=base_llm_cfg["freeze"],
             use_lora=base_llm_cfg.get("use_lora", True)
         )
+        print(f"BaseLLM initialized with hidden_size: {self.base_llm.hidden_size}")  # 확인
 
-        # (2) Light LLM => 자기 tokenizer도 똑같이 from_pretrained(...)
-        #                 (모델 가중치 없이 tokenizer만? or 작은 모델도 가능)
+        # (2) Light LLM => tokenizer만 로딩
         self.light_llm = LightWeightLLM(
             model_name=lightweight_llm_cfg["model_name"],
             lr=lightweight_llm_cfg["lr"],
@@ -45,15 +48,18 @@ class TitanModel(pl.LightningModule):
             freeze=vit_eagle_cfg["freeze"]
         )
 
-        # (4) Trajectory
+        # (4) Trajectory Encoder
         self.traj_enc = TrajectoryEncoder(
-            input_dim=trajectory_encoder_cfg["input_dim"],
+            input_dim=trajectory_encoder_cfg["input_dim"],  # 2
             hidden_dim=trajectory_encoder_cfg["hidden_dim"]
         )
 
-        # (5) Titans
+        # (5) 임베딩 크기 조정을 위한 선형 레이어 수정 (768 -> hidden_size)
+        self.embedding_projection = nn.Linear(768, self.base_llm.hidden_size)  # 768 -> 2048
+
+        # (6) Titans Decoder
         self.titans = TitansDecoder(
-            d_model = titans_cfg["d_model"],
+            d_model = titans_cfg["d_model"],  # 2048
             memory_depth = titans_cfg["memory_depth"],
             decoder_layers = titans_cfg["decoder_layers"],
             surprise_decay = titans_cfg["surprise_decay"],
@@ -63,66 +69,134 @@ class TitanModel(pl.LightningModule):
 
         self.opt_cfg = optimizer_cfg
 
+        # 테스트 결과 저장을 위한 리스트 초기화
+        self.test_outputs = []
+
     def forward(self, batch):
         # A) Light LLM => tokenizer
-        #    scene_text -> tokenize
         tokens = self.light_llm.tokenize_text(batch["scene_text"])
         input_ids = tokens["input_ids"].to(self.device)
         attn_mask = tokens["attention_mask"].to(self.device)
 
-        # B) -> Base LLM: 지금 base_llm는 'inputs_embeds'를 받도록 구성되어 있음
-        #    but we only have input_ids => need to embed ourselves or change base_llm's forward
-        # => Let's do a quick hack: create an embedding ourselves is tricky
-        #    We'll just do a dummy user_emb for demonstration
+        # B) Base LLM에 'inputs_embeds' 전달
         Bsz = input_ids.size(0)
-        user_emb = torch.zeros(Bsz, 768, device=self.device)
+        user_emb = torch.zeros(Bsz, 768, device=self.device)  # 더미 유저 임베딩
 
-        # C) image -> vit
-        drone_img = batch["drone_image"].to(self.device)
-        if drone_img.dim() == 3:
-            drone_img = drone_img.unsqueeze(0)
-        img_emb = self.vit(drone_img)  # (B,768)
+        # C) 이미지 처리
+        drone_img = batch["drone_image"]  # PIL Images 리스트
+        img_emb = self.vit(drone_img)  # [B, hidden_size=768]
 
-        # D) trajectory -> traj_enc
-        traj = batch["trajectory"].to(self.device)
-        B,T,D = traj.shape
-        if B==1 and T==1:
-            traj = traj.view(B,D)
-        if traj.shape[1] < 6:
-            pad = torch.zeros((B,6 - traj.shape[1]), device=traj.device)
-            traj = torch.cat([traj, pad], dim=1)
-        traj_emb = self.traj_enc(traj.unsqueeze(1))  # (B,768)
+        # D) 트래젝토리 처리
+        traj = batch["trajectory"].to(self.device)  # [B,1,2]
+        traj = traj.squeeze(1)  # [B,2]
+        traj_emb = self.traj_enc(traj)  # [B, 768]
 
-        # E) concat => (B,3,768)
-        combined = torch.stack([user_emb, img_emb, traj_emb], dim=1)  # (B,3,768)
+        # E) 임베딩 결합 => [B,3,768]
+        combined = torch.stack([user_emb, img_emb, traj_emb], dim=1)  # [B,3,768]
 
-        # F) base_llm => forward => (B,3, hidden_dim?)
+        # F) 임베딩 크기 조정
+        combined_projected = self.embedding_projection(combined)  # [B,3,2048]
+
+        # G) Base LLM 통해 전달 => [B,3, hidden_size=2048]
         base_out = self.base_llm(
-            inputs_embeds=combined,
+            inputs_embeds=combined_projected,
             attention_mask=None
         )
-        hidden = base_out.hidden_states[-1]  # (B,3, hidden_dim)
+        hidden = base_out.hidden_states[-1]  # [B,3, hidden_size] = [B,3,2048]
 
-        # G) Titans => (B,2,768)
-        dec_out = self.titans(hidden)
-        return dec_out
+        # H) Titans Decoder 통해 궤적 예측 => [B,2,2]
+        traj_out = self.titans(hidden)  # [B,2,2]
+
+        return traj_out
 
     def training_step(self, batch, batch_idx):
-        out = self.forward(batch)
-        traj_pred = out[:,1,:]  # (B,768)
-        traj_label = batch["traj_label"].to(self.device)
-        loss = F.mse_loss(traj_pred, traj_label)
-
-        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
-        return loss
+        traj_pred = self.forward(batch)  # [B, future_steps, 2]
+        traj_label = batch["traj_label"].to(self.device)  # [B, future_steps, 2]
+        
+        # MSE Loss 계산
+        mse_loss = F.mse_loss(traj_pred, traj_label)
+        
+        # 손실 함수의 상세 정보 로깅
+        self.log("train_loss_mse", mse_loss, on_step=True, on_epoch=True, prog_bar=True)
+        
+        return mse_loss
 
     def validation_step(self, batch, batch_idx):
-        out = self.forward(batch)
-        traj_pred = out[:,1,:]
-        traj_label = batch["traj_label"].to(self.device)
-        val_loss = F.mse_loss(traj_pred, traj_label)
-        self.log("val_loss", val_loss, on_step=False, on_epoch=True, prog_bar=True)
-        return val_loss
+        traj_pred = self.forward(batch)  # [B, future_steps, 2]
+        traj_label = batch["traj_label"].to(self.device)  # [B, future_steps, 2]
+        
+        # MSE Loss 계산
+        mse_loss = F.mse_loss(traj_pred, traj_label)
+        
+        # ADE (Average Displacement Error) 계산
+        ade = torch.mean(torch.norm(traj_pred - traj_label, dim=2))  # [B, future_steps] -> 평균
+        
+        # FDE (Final Displacement Error) 계산
+        fde = torch.mean(torch.norm(traj_pred[:, -1, :] - traj_label[:, -1, :], dim=1))  # [B]
+        
+        # 손실 및 지표 로깅
+        self.log("val_loss_mse", mse_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("val_ADE", ade, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("val_FDE", fde, on_step=False, on_epoch=True, prog_bar=True)
+        
+        # **샘플 텍스트 로그 추가**
+        if batch_idx == 0:
+            sample_text = batch["scene_text"][0]  # 배치의 첫 번째 텍스트
+            self.logger.experiment.add_text("Sample Scene Text", sample_text, self.current_epoch)
+        
+        return mse_loss
+
+    def test_step(self, batch, batch_idx):
+        traj_pred = self.forward(batch)  # [B, future_steps, 2]
+        traj_label = batch["traj_label"].to(self.device)  # [B, future_steps, 2]
+        
+        # ADE (Average Displacement Error) 계산
+        ade = torch.mean(torch.norm(traj_pred - traj_label, dim=2))  # [B, future_steps] -> 평균
+        
+        # FDE (Final Displacement Error) 계산
+        fde = torch.mean(torch.norm(traj_pred[:, -1, :] - traj_label[:, -1, :], dim=1))  # [B]
+        
+        # 지표 로깅
+        self.log("test_ADE", ade, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("test_FDE", fde, on_step=False, on_epoch=True, prog_bar=True)
+        
+        # **예측된 궤적과 원본 텍스트 반환**
+        output = {
+            "pred_traj": traj_pred.detach().cpu(),
+            "true_traj": traj_label.detach().cpu(),
+            "scene_text": batch["scene_text"]
+        }
+        self.test_outputs.append(output)
+        return output
+
+    def on_test_epoch_end(self):
+        # 모든 배치의 결과를 하나의 리스트로 합칩니다.
+        all_pred_traj = []
+        all_true_traj = []
+        all_scene_text = []
+        
+        for output in self.test_outputs:
+            all_pred_traj.append(output["pred_traj"])
+            all_true_traj.append(output["true_traj"])
+            all_scene_text.extend(output["scene_text"])
+        
+        # 텐서를 하나로 합칩니다.
+        all_pred_traj = torch.cat(all_pred_traj, dim=0).numpy()  # [N, future_steps, 2]
+        all_true_traj = torch.cat(all_true_traj, dim=0).numpy()  # [N, future_steps, 2]
+        
+        # scene_text 리스트는 이미 리스트 형태이므로 별도의 변환이 필요 없습니다.
+        
+        # 예측 결과를 CSV 파일로 저장하거나, 다른 형식으로 저장할 수 있습니다.
+        data = {
+            "scene_text": all_scene_text,
+            "pred_traj": [traj.tolist() for traj in all_pred_traj],
+            "true_traj": [traj.tolist() for traj in all_true_traj]
+        }
+
+        df = pd.DataFrame(data)
+        # 결과를 CSV 파일로 저장
+        df.to_csv("test_results.csv", index=False)
+        print("Test results saved to test_results.csv")
 
     def configure_optimizers(self):
         return torch.optim.AdamW(

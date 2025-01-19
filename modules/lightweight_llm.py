@@ -16,10 +16,18 @@ class LightWeightLLM(pl.LightningModule):
         # => tokenizer 만 로딩
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name,
-            use_fast=True,
+            use_fast=False,
             trust_remote_code=True
         )
-        # (모델 가중치 없음)
+
+        # pad_token이 없으면 eos_token을 패딩 토큰으로 설정하거나 새로운 pad_token 추가
+        if self.tokenizer.pad_token is None:
+            if self.tokenizer.eos_token is not None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            else:
+                self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+                # 모델에도 pad_token을 추가했는지 확인 필요
+                # BaseLLM에서도 추가해야 할 수 있음
 
         self.lr = lr
 

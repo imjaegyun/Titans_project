@@ -1,0 +1,41 @@
+trainer:
+  max_epochs: 5
+  accelerator: gpu
+  devices: 1
+seed: 42
+debug: false
+data:
+  csv_path: /home/user/imjaegyun/Titans_model/Titans_project/datasets/DJI_0023_stab.csv
+  video_path: /home/user/imjaegyun/Titans_model/Titans_project/datasets/DJI_0023_stab.mp4
+  train_size: 20
+  val_size: 4
+  train_batch_size: 4
+  val_batch_size: 4
+  frames_per_second: 10
+  past_sec: 1
+model:
+  lightweight_llm:
+    model_name: meta-llama/Llama-3.2-1B
+    lr: 1.0e-05
+    use_lora: false
+  vit_eagle:
+    model_name: google/vit-base-patch16-224
+    freeze: true
+  trajectory_encoder:
+    input_dim: 12
+    hidden_dim: 128
+  base_llm:
+    model_name: meta-llama/Llama-3.2-1B
+    tokenizer_name: meta-llama/Llama-3.2-1B
+    freeze: true
+    use_lora: true
+  titans:
+    d_model: 768
+    memory_depth: 2
+    decoder_layers: 2
+    surprise_decay: 0.9
+    momentum: 0.9
+    forget_alpha: 0.1
+  optimizer:
+    lr: 0.0001
+    weight_decay: 0.01
