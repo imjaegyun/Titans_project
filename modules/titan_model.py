@@ -67,10 +67,18 @@ class TitanModel(pl.LightningModule):
             forget_alpha = titans_cfg["forget_alpha"]
         )
 
+        # (7) 차선 변경 여부 분류기
+        self.lane_change_classifier = nn.Linear(self.base_llm.hidden_size, 1)  # 이진 분류
+
+        # (8) Optimizer 설정
         self.opt_cfg = optimizer_cfg
 
         # 테스트 결과 저장을 위한 리스트 초기화
         self.test_outputs = []
+
+        # 손실 함수 정의
+        self.criterion_traj = nn.MSELoss()
+        self.criterion_lane_change = nn.BCEWithLogitsLoss()
 
     def forward(self, batch):
         # A) Light LLM => tokenizer
@@ -100,71 +108,159 @@ class TitanModel(pl.LightningModule):
         # G) Base LLM 통해 전달 => [B,3, hidden_size=2048]
         base_out = self.base_llm(
             inputs_embeds=combined_projected,
-            attention_mask=None
+            attention_mask=attn_mask  # attention_mask 설정
         )
-        hidden = base_out.hidden_states[-1]  # [B,3, hidden_size] = [B,3,2048]
+        hidden_states = base_out.hidden_states[-1]  # [B,3,2048]
 
-        # H) Titans Decoder 통해 궤적 예측 => [B,2,2]
-        traj_out = self.titans(hidden)  # [B,2,2]
+        # Separate hidden for decoder and classification
+        # For decoder: [B, T_out, D] where T_out=2
+        # For classification: [B,D] (mean of hidden_states)
+        T_out = self.titans.T_out  # 2
+        if hidden_states.size(1) >= T_out:
+            hidden_for_decoder = hidden_states[:, :T_out, :]  # [B,2,2048]
+        else:
+            # T_out=2, if less, repeat last step
+            repeat_times = T_out - hidden_states.size(1)
+            last_step = hidden_states[:, -1:, :].repeat(1, repeat_times, 1)  # [B,1,2048]
+            hidden_for_decoder = torch.cat([hidden_states, last_step], dim=1)  # [B,2,2048]
+            print(f"TitanModel: Hidden size less than T_out. Repeated last timestep to make T={T_out}")
 
-        return traj_out
+        # For classification
+        hidden_for_classification = hidden_states.mean(dim=1)  # [B,2048]
+
+        # I) Titans Decoder 통해 궤적 예측 => [B,2,2]
+        traj_out = self.titans(hidden_for_decoder)  # [B,2,2]
+
+        # J) 차선 변경 여부 예측
+        lane_change_logit = self.lane_change_classifier(hidden_for_classification).squeeze(1)  # [B]
+
+        # K) 차선 변경 의도 설명 생성
+        lane_change_pred = torch.sigmoid(lane_change_logit) > 0.5  # [B]
+        lane_change_pred = lane_change_pred.int().cpu().tolist()  # 리스트 형태로 변환
+
+        explanations = self.generate_explanation(batch["scene_text"], lane_change_pred)
+
+        return {
+            "traj_out": traj_out,
+            "lane_change_logit": lane_change_logit,
+            "lane_change_explainer_text": explanations  # 동적 텍스트 생성
+        }
+
+    def generate_explanation(self, scene_texts, lane_change_preds):
+        """
+        BaseLLM을 사용하여 차선 변경 의도 설명을 생성합니다.
+        """
+        explanations = []
+        for text, pred in zip(scene_texts, lane_change_preds):
+            if pred == 1:
+                prompt = f"{text}\n\nThe vehicle is changing lanes. Provide an explanation for this action:"
+            else:
+                prompt = f"{text}\n\nThe vehicle is maintaining its current lane. Provide an explanation for this decision:"
+
+            # BaseLLM의 generate 메서드를 사용하여 텍스트 생성
+            generated_ids = self.base_llm.model.generate(
+                input_ids=self.base_llm.tokenizer.encode(prompt, return_tensors='pt').to(self.device),
+                max_new_tokens=150,  # max_length 대신 max_new_tokens 사용
+                num_return_sequences=1,
+                do_sample=True,
+                top_p=0.95,
+                top_k=60,
+                pad_token_id=self.base_llm.tokenizer.eos_token_id  # pad_token_id 설정
+            )
+            explanation = self.base_llm.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+            explanations.append(explanation)
+
+        return explanations
 
     def training_step(self, batch, batch_idx):
-        traj_pred = self.forward(batch)  # [B, future_steps, 2]
-        traj_label = batch["traj_label"].to(self.device)  # [B, future_steps, 2]
-        
+        outputs = self.forward(batch)
+        traj_pred = outputs["traj_out"]  # [B, 2, 2]
+        lane_change_logit = outputs["lane_change_logit"]  # [B]
+        lane_change_label = batch["lane_change_label"].float().to(self.device)  # [B]
+
+        traj_label = batch["traj_label"].to(self.device)  # [B, 2, 2]
+
         # MSE Loss 계산
-        mse_loss = F.mse_loss(traj_pred, traj_label)
-        
+        mse_loss = self.criterion_traj(traj_pred, traj_label)
+
+        # 차선 변경 여부 손실 계산
+        lane_change_loss = self.criterion_lane_change(lane_change_logit, lane_change_label)
+
+        # 총 손실
+        total_loss = mse_loss + lane_change_loss
+
         # 손실 함수의 상세 정보 로깅
         self.log("train_loss_mse", mse_loss, on_step=True, on_epoch=True, prog_bar=True)
-        
-        return mse_loss
+        self.log("train_loss_lane_change", lane_change_loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("train_loss_total", total_loss, on_step=True, on_epoch=True, prog_bar=True)
+
+        return total_loss
 
     def validation_step(self, batch, batch_idx):
-        traj_pred = self.forward(batch)  # [B, future_steps, 2]
-        traj_label = batch["traj_label"].to(self.device)  # [B, future_steps, 2]
-        
+        outputs = self.forward(batch)
+        traj_pred = outputs["traj_out"]  # [B, 2, 2]
+        lane_change_logit = outputs["lane_change_logit"]  # [B]
+        lane_change_label = batch["lane_change_label"].float().to(self.device)  # [B]
+
+        traj_label = batch["traj_label"].to(self.device)  # [B, 2, 2]
+
         # MSE Loss 계산
-        mse_loss = F.mse_loss(traj_pred, traj_label)
-        
+        mse_loss = self.criterion_traj(traj_pred, traj_label)
+
+        # 차선 변경 여부 손실 계산
+        lane_change_loss = self.criterion_lane_change(lane_change_logit, lane_change_label)
+
         # ADE (Average Displacement Error) 계산
-        ade = torch.mean(torch.norm(traj_pred - traj_label, dim=2))  # [B, future_steps] -> 평균
-        
+        ade = torch.mean(torch.norm(traj_pred - traj_label, dim=2))  # [B, 2] -> 평균
+
         # FDE (Final Displacement Error) 계산
         fde = torch.mean(torch.norm(traj_pred[:, -1, :] - traj_label[:, -1, :], dim=1))  # [B]
-        
+
+        # 차선 변경 정확도 계산
+        lane_change_pred = torch.sigmoid(lane_change_logit) > 0.5
+        lane_change_acc = (lane_change_pred.float() == lane_change_label).float().mean()
+
         # 손실 및 지표 로깅
         self.log("val_loss_mse", mse_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("val_loss_lane_change", lane_change_loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log("val_ADE", ade, on_step=False, on_epoch=True, prog_bar=True)
         self.log("val_FDE", fde, on_step=False, on_epoch=True, prog_bar=True)
-        
-        # **샘플 텍스트 로그 추가**
-        if batch_idx == 0:
-            sample_text = batch["scene_text"][0]  # 배치의 첫 번째 텍스트
-            self.logger.experiment.add_text("Sample Scene Text", sample_text, self.current_epoch)
-        
+        self.log("val_lane_change_acc", lane_change_acc, on_step=False, on_epoch=True, prog_bar=True)
+
         return mse_loss
 
     def test_step(self, batch, batch_idx):
-        traj_pred = self.forward(batch)  # [B, future_steps, 2]
-        traj_label = batch["traj_label"].to(self.device)  # [B, future_steps, 2]
-        
+        outputs = self.forward(batch)
+        traj_pred = outputs["traj_out"]  # [B, 2, 2]
+        lane_change_logit = outputs["lane_change_logit"]  # [B]
+        lane_change_label = batch["lane_change_label"].float().to(self.device)  # [B]
+
+        traj_label = batch["traj_label"].to(self.device)  # [B, 2, 2]
+
         # ADE (Average Displacement Error) 계산
-        ade = torch.mean(torch.norm(traj_pred - traj_label, dim=2))  # [B, future_steps] -> 평균
-        
+        ade = torch.mean(torch.norm(traj_pred - traj_label, dim=2))  # [B, 2] -> 평균
+
         # FDE (Final Displacement Error) 계산
         fde = torch.mean(torch.norm(traj_pred[:, -1, :] - traj_label[:, -1, :], dim=1))  # [B]
-        
+
+        # 차선 변경 정확도 계산
+        lane_change_pred = torch.sigmoid(lane_change_logit) > 0.5
+        lane_change_acc = (lane_change_pred.float() == lane_change_label).float().mean()
+
         # 지표 로깅
         self.log("test_ADE", ade, on_step=False, on_epoch=True, prog_bar=True)
         self.log("test_FDE", fde, on_step=False, on_epoch=True, prog_bar=True)
-        
-        # **예측된 궤적과 원본 텍스트 반환**
+        self.log("test_lane_change_acc", lane_change_acc, on_step=False, on_epoch=True, prog_bar=True)
+
+        # 예측된 궤적과 차선 변경 예측 및 설명 반환
+        lane_change_pred_label = lane_change_pred.int().cpu().tolist()
+        lane_change_explainer = outputs["lane_change_explainer_text"]  # 리스트 형태
+
         output = {
+            "lane_change_pred": lane_change_pred_label,
+            "lane_change_explainer": lane_change_explainer,
             "pred_traj": traj_pred.detach().cpu(),
-            "true_traj": traj_label.detach().cpu(),
-            "scene_text": batch["scene_text"]
+            "true_traj": traj_label.detach().cpu()
         }
         self.test_outputs.append(output)
         return output
@@ -173,22 +269,23 @@ class TitanModel(pl.LightningModule):
         # 모든 배치의 결과를 하나의 리스트로 합칩니다.
         all_pred_traj = []
         all_true_traj = []
-        all_scene_text = []
-        
+        all_lane_change_pred = []
+        all_lane_change_explainer = []
+
         for output in self.test_outputs:
             all_pred_traj.append(output["pred_traj"])
             all_true_traj.append(output["true_traj"])
-            all_scene_text.extend(output["scene_text"])
-        
+            all_lane_change_pred.extend(output["lane_change_pred"])
+            all_lane_change_explainer.extend(output["lane_change_explainer"])
+
         # 텐서를 하나로 합칩니다.
-        all_pred_traj = torch.cat(all_pred_traj, dim=0).numpy()  # [N, future_steps, 2]
-        all_true_traj = torch.cat(all_true_traj, dim=0).numpy()  # [N, future_steps, 2]
-        
-        # scene_text 리스트는 이미 리스트 형태이므로 별도의 변환이 필요 없습니다.
-        
-        # 예측 결과를 CSV 파일로 저장하거나, 다른 형식으로 저장할 수 있습니다.
+        all_pred_traj = torch.cat(all_pred_traj, dim=0).numpy()  # [N, 2, 2]
+        all_true_traj = torch.cat(all_true_traj, dim=0).numpy()  # [N, 2, 2]
+
+        # 예측 결과를 CSV 파일로 저장
         data = {
-            "scene_text": all_scene_text,
+            "lane_change_pred": all_lane_change_pred,
+            "lane_change_explainer": all_lane_change_explainer,
             "pred_traj": [traj.tolist() for traj in all_pred_traj],
             "true_traj": [traj.tolist() for traj in all_true_traj]
         }

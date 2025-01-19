@@ -22,7 +22,11 @@ trainer:
       filename: "model-{epoch:02d}-{val_loss_mse:.2f}"
       save_top_k: 3
       mode: "min"
-
+  logger:
+      _target_: pytorch_lightning.loggers.WandbLogger
+      name: "your_run_name"
+      project: "your_project_name"
+      log_model: True
 seed: 42
 debug: false
 

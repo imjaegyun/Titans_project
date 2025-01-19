@@ -60,19 +60,47 @@ class TitansDecoder(nn.Module):
         self.final_linear = nn.Linear(d_model, self.T_out * 2)
 
     def forward(self, x):
+        # 입력 차원 확인 및 변환
+        if len(x.shape) == 2:
+            # [B, D] -> [B, 1, D]
+            x = x.unsqueeze(1)
+            print(f"TitansDecoder received input with shape: {x.shape} (reshaped from [B, D] to [B, 1, D])")
+        elif len(x.shape) == 3:
+            # [B, T, D]
+            pass
+        else:
+            raise ValueError(f"Unexpected input shape: {x.shape}")
+
         B, T, D = x.shape
+
+        # T가 T_out보다 작거나 클 경우 조정
+        if T < self.T_out:
+            # 마지막 타임스텝 반복하여 T_out 맞추기
+            repeat_times = self.T_out - T
+            last_step = x[:, -1:, :].repeat(1, repeat_times, 1)
+            x = torch.cat([x, last_step], dim=1)
+            print(f"TitansDecoder input T was less than T_out. Repeated last timestep to make T={self.T_out}")
+        elif T > self.T_out:
+            # T_out으로 잘라내기
+            x = x[:, :self.T_out, :]
+            print(f"TitansDecoder input T was greater than T_out. Truncated to T={self.T_out}")
+
+        B, T, D = x.shape  # 이제 T == T_out
+
         out = x
-        for layerdict in self.layers:
+        for idx, layerdict in enumerate(self.layers):
             mem = layerdict["mem"]
             cor = layerdict["core"]
             out_tokens = []
             for t in range(T):
-                mo = mem(out[:, t, :])  # [B,2048]
-                co = cor(mo)             # [B,2048]
+                mo = mem(out[:, t, :])  # [B, D]
+                co = cor(mo)             # [B, D]
                 out_tokens.append(co)
-            out = torch.stack(out_tokens, dim=1)  # [B,T,2048]
+            out = torch.stack(out_tokens, dim=1)  # [B, T, D]
+            print(f"TitansDecoder layer {idx+1}/{self.decoder_layers} processed. Current shape: {out.shape}")
 
-        out_avg = out.mean(dim=1)  # [B,2048]
-        out_final = self.final_linear(out_avg)  # [B,4]
+        out_avg = out.mean(dim=1)  # [B, D]
+        out_final = self.final_linear(out_avg)  # [B, T_out*2]
         out_final = out_final.view(B, self.T_out, 2)  # [B,2,2]
+        print(f"TitansDecoder final output shape: {out_final.shape}")
         return out_final

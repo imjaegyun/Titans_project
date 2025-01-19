@@ -8,53 +8,43 @@ import torchvision.transforms as T
 import torch
 from PIL import Image
 from .data_prep import build_scene_description
+from sklearn.model_selection import train_test_split
 
 def custom_collate(batch):
     """
     커스텀 collate_fn:
     - 'drone_image'는 PIL 이미지 리스트로 유지
+    - 'scene_text'는 배치 리스트로 유지 (모델 입력 용도)
     - 나머지 필드는 기본 collate_fn을 사용하여 텐서로 변환
     """
     scene_texts = [item['scene_text'] for item in batch]
     drone_images = [item['drone_image'] for item in batch]
     trajectories = torch.stack([item['trajectory'] for item in batch])
     traj_labels = torch.stack([item['traj_label'] for item in batch])
+    lane_change_labels = torch.stack([item['lane_change_label'] for item in batch])
     
     return {
-        'scene_text': scene_texts,
+        'scene_text': scene_texts,          # 모델 입력 용도
         'drone_image': drone_images,
         'trajectory': trajectories,
-        'traj_label': traj_labels
+        'traj_label': traj_labels,
+        'lane_change_label': lane_change_labels
     }
 
 class DroneTrajectoryDataset(Dataset):
-    def __init__(self, csv_path, video_path, size=20, frames_per_second=10, past_sec=1, future_steps=2):
+    def __init__(self, df, video_path, frames_per_second=10, past_sec=1, future_steps=2):
         super().__init__()
-        self.csv_path = csv_path
+        self.df = df.reset_index(drop=True)
         self.video_path = video_path
-        self.size = size
         self.fps = frames_per_second
         self.past_sec = past_sec
         self.future_steps = future_steps  # 미래 프레임 수
-
-        df = pd.read_csv(csv_path)
-        if len(df) > size + future_steps:
-            df = df.head(size + future_steps).copy().reset_index(drop=True)
-        self.df = df
-
-        self.frame_count = self._get_frame_count()
 
         self.transform = T.Compose([
             T.ToPILImage(),
             T.Resize((224, 224), interpolation=T.InterpolationMode.BILINEAR, antialias=True),
             # T.ToTensor()  # ToTensor() 제거
         ])
-
-    def _get_frame_count(self):
-        cap = cv2.VideoCapture(self.video_path)
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        cap.release()
-        return frame_count
 
     def __len__(self):
         # 미래 프레임을 고려하여 데이터셋 크기 조정
@@ -72,7 +62,7 @@ class DroneTrajectoryDataset(Dataset):
         scene_text = build_scene_description(row, previous_row)
 
         # 현재 프레임 인덱스
-        frame_idx = idx  # 시퀀스 내에서의 인덱스 사용
+        frame_idx = row['frame']  # 실제 프레임 번호 사용
 
         cap = cv2.VideoCapture(self.video_path)
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
@@ -108,18 +98,31 @@ class DroneTrajectoryDataset(Dataset):
                 future_traj.append([cx, cy])
         traj_label = torch.tensor(future_traj, dtype=torch.float)  # [future_steps, 2]
 
+        # 차선 변경 여부 레이블 추가
+        # 'lane' 필드의 변화를 기반으로 판단
+        current_lane = row.get('lane', None)
+        if idx + self.future_steps < len(self.df):
+            future_row = self.df.iloc[idx + self.future_steps]
+            future_lane = future_row.get('lane', None)
+            lane_change = 1 if future_lane != current_lane else 0
+        else:
+            lane_change = 0  # 미래 프레임이 없을 경우 변경 없음
+
+        lane_change_label = torch.tensor(lane_change, dtype=torch.float)  # [1]
+
         return {
             "scene_text": scene_text,
             "drone_image": frame_pil,
             "trajectory": traj_input,
-            "traj_label": traj_label
+            "traj_label": traj_label,
+            "lane_change_label": lane_change_label  # 추가된 부분
         }
 
 class DroneTrajectoryDataModule(pl.LightningDataModule):
     def __init__(self, csv_path, video_path,
-                 train_size, val_size, test_size,
-                 train_batch_size, val_batch_size, test_batch_size,
-                 frames_per_second=10, past_sec=1, future_steps=2):
+                 train_size=70, val_size=20, test_size=10,
+                 train_batch_size=4, val_batch_size=4, test_batch_size=4,
+                 frames_per_second=10, past_sec=1, future_steps=2, seed=42):
         super().__init__()
         self.csv_path = csv_path
         self.video_path = video_path
@@ -132,35 +135,56 @@ class DroneTrajectoryDataModule(pl.LightningDataModule):
         self.fps = frames_per_second
         self.past_sec = past_sec
         self.future_steps = future_steps
+        self.seed = seed
         self.num_workers = 4  # 초기에는 4으로 설정, 시스템에 맞게 조정
 
     def setup(self, stage=None):
-        if stage == "fit" or stage is None:
-            self.train_dataset = DroneTrajectoryDataset(
-                self.csv_path,
-                self.video_path,
-                size=self.train_size,
-                frames_per_second=self.fps,
-                past_sec=self.past_sec,
-                future_steps=self.future_steps
-            )
-            self.val_dataset = DroneTrajectoryDataset(
-                self.csv_path,
-                self.video_path,
-                size=self.val_size,
-                frames_per_second=self.fps,
-                past_sec=self.past_sec,
-                future_steps=self.future_steps
-            )
-        if stage == "test" or stage is None:
-            self.test_dataset = DroneTrajectoryDataset(
-                self.csv_path,
-                self.video_path,
-                size=self.test_size,
-                frames_per_second=self.fps,
-                past_sec=self.past_sec,
-                future_steps=self.future_steps
-            )
+        # 전체 데이터셋 로드
+        df = pd.read_csv(self.csv_path)
+        
+        # track_id 기준으로 그룹화
+        track_ids = df['track_id'].unique()
+        
+        # train: 70%, val: 20%, test: 10% 비율로 track_ids 분할
+        train_ids, temp_ids = train_test_split(
+            track_ids,
+            test_size=(100 - self.train_size) / 100,
+            random_state=self.seed
+        )
+        val_ratio = self.val_size / (self.val_size + self.test_size)  # 20 / (20 + 10) = 0.666...
+        val_ids, test_ids = train_test_split(
+            temp_ids,
+            test_size=1 - val_ratio,
+            random_state=self.seed
+        )
+        
+        # 각 split에 해당하는 데이터프레임 생성
+        train_df = df[df['track_id'].isin(train_ids)].reset_index(drop=True)
+        val_df = df[df['track_id'].isin(val_ids)].reset_index(drop=True)
+        test_df = df[df['track_id'].isin(test_ids)].reset_index(drop=True)
+        
+        # 각 split에 대한 Dataset 인스턴스 생성
+        self.train_dataset = DroneTrajectoryDataset(
+            train_df,
+            self.video_path,
+            frames_per_second=self.fps,
+            past_sec=self.past_sec,
+            future_steps=self.future_steps
+        )
+        self.val_dataset = DroneTrajectoryDataset(
+            val_df,
+            self.video_path,
+            frames_per_second=self.fps,
+            past_sec=self.past_sec,
+            future_steps=self.future_steps
+        )
+        self.test_dataset = DroneTrajectoryDataset(
+            test_df,
+            self.video_path,
+            frames_per_second=self.fps,
+            past_sec=self.past_sec,
+            future_steps=self.future_steps
+        )
 
     def train_dataloader(self):
         return DataLoader(
