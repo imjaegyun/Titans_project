@@ -1,5 +1,3 @@
-# Titans_project/configs/config.yaml
-
 defaults:
   - _self_
   - data: dataset
@@ -10,9 +8,13 @@ trainer:
   accelerator: "gpu"  # 또는 "cpu", "auto"로 설정
   devices: 1  # 사용하려는 디바이스 수
   logger:
-    _target_: pytorch_lightning.loggers.TensorBoardLogger
-    save_dir: logs/  # 로그를 저장할 디렉토리
-    name: default  # 로그 이름
+    - _target_: pytorch_lightning.loggers.TensorBoardLogger
+      save_dir: logs/  # 로그를 저장할 디렉토리
+      name: default  # 로그 이름
+    - _target_: pytorch_lightning.loggers.WandbLogger
+      name: "imjaegyun"
+      project: "titan"
+      log_model: True
 
   log_every_n_steps: 10
   callbacks:
@@ -22,21 +24,15 @@ trainer:
       filename: "model-{epoch:02d}-{val_loss_mse:.2f}"
       save_top_k: 3
       mode: "min"
-  logger:
-      _target_: pytorch_lightning.loggers.WandbLogger
-      name: "your_run_name"
-      project: "your_project_name"
-      log_model: True
 seed: 42
 debug: false
-
 
 
 # Titans_project/configs/data/dataset.yaml
 
 data:
-  csv_path: "/home/user/imjaegyun/Titans_model/Titans_project/datasets/DJI_0023_stab.csv"
-  video_path: "/home/user/imjaegyun/Titans_model/Titans_project/datasets/DJI_0023_stab.mp4"
+  csv_path: "/home/im_jg/Titans_project/datasets/DJI_0023_stab.csv"
+  video_path: "/home/im_jg/Titans_project/datasets/DJI_0023_stab.mp4"
   train_size: 70  # 예시 값, 실제 데이터에 맞게 조정
   val_size: 20    # 예시 값, 실제 데이터에 맞게 조정
   test_size: 10   # 추가된 부분

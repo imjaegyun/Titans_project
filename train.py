@@ -54,7 +54,11 @@ def main(cfg: DictConfig):
     # Logger 인스턴스화
     logger = None
     if "logger" in cfg.trainer:
-        logger = instantiate(cfg.trainer.logger)
+        logger_cfg = cfg.trainer.logger
+        if isinstance(logger_cfg, list):
+            logger = [instantiate(lg_cfg) for lg_cfg in logger_cfg]
+        else:
+            logger = instantiate(logger_cfg)
 
     trainer = pl.Trainer(
         max_epochs=cfg.trainer.max_epochs,
